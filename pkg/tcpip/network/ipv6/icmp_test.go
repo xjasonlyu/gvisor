@@ -294,7 +294,13 @@ func TestICMPCounts(t *testing.T) {
 		icmp := header.ICMPv6(buffer.NewView(typ.size + len(typ.extraData)))
 		copy(icmp[typ.size:], typ.extraData)
 		icmp.SetType(typ.typ)
-		icmp.SetChecksum(header.ICMPv6Checksum(icmp[:typ.size], lladdr0, lladdr1, buffer.View(typ.extraData).ToVectorisedView()))
+		icmp.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+			Header:      icmp[:typ.size],
+			Src:         lladdr0,
+			Dst:         lladdr1,
+			PayloadCsum: header.Checksum(typ.extraData, 0 /* initial */),
+			PayloadLen:  len(typ.extraData),
+		}))
 		handleICMPInIPv6(ep, lladdr1, lladdr0, icmp)
 	}
 
@@ -468,7 +474,11 @@ func TestLinkResolution(t *testing.T) {
 	hdr := buffer.NewPrependable(int(r.MaxHeaderLength()) + header.IPv6MinimumSize + header.ICMPv6EchoMinimumSize)
 	pkt := header.ICMPv6(hdr.Prepend(header.ICMPv6EchoMinimumSize))
 	pkt.SetType(header.ICMPv6EchoRequest)
-	pkt.SetChecksum(header.ICMPv6Checksum(pkt, r.LocalAddress, r.RemoteAddress, buffer.VectorisedView{}))
+	pkt.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+		Header: pkt,
+		Src:    r.LocalAddress,
+		Dst:    r.RemoteAddress,
+	}))
 
 	// We can't send our payload directly over the route because that
 	// doesn't provoke NDP discovery.
@@ -657,7 +667,11 @@ func TestICMPChecksumValidationSimple(t *testing.T) {
 					copy(icmp[typ.size:], typ.extraData)
 					icmp.SetType(typ.typ)
 					if checksum {
-						icmp.SetChecksum(header.ICMPv6Checksum(icmp, lladdr1, lladdr0, buffer.View{}.ToVectorisedView()))
+						icmp.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+							Header: icmp,
+							Src:    lladdr1,
+							Dst:    lladdr0,
+						}))
 					}
 					ip := header.IPv6(buffer.NewView(header.IPv6MinimumSize))
 					ip.Encode(&header.IPv6Fields{
@@ -849,7 +863,11 @@ func TestICMPChecksumValidationWithPayload(t *testing.T) {
 				payloadFn(icmpHdr.Payload())
 
 				if checksum {
-					icmpHdr.SetChecksum(header.ICMPv6Checksum(icmpHdr, lladdr1, lladdr0, buffer.VectorisedView{}))
+					icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+						Header: icmpHdr,
+						Src:    lladdr1,
+						Dst:    lladdr0,
+					}))
 				}
 
 				ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize))
@@ -1028,7 +1046,13 @@ func TestICMPChecksumValidationWithPayloadMultipleViews(t *testing.T) {
 				payloadFn(payload)
 
 				if checksum {
-					icmpHdr.SetChecksum(header.ICMPv6Checksum(icmpHdr, lladdr1, lladdr0, payload.ToVectorisedView()))
+					icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+						Header:      icmpHdr,
+						Src:         lladdr1,
+						Dst:         lladdr0,
+						PayloadCsum: header.Checksum(payload, 0 /* initial */),
+						PayloadLen:  len(payload),
+					}))
 				}
 
 				ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize))
@@ -1294,7 +1318,11 @@ func TestPacketQueing(t *testing.T) {
 				pkt.SetType(header.ICMPv6EchoRequest)
 				pkt.SetCode(0)
 				pkt.SetChecksum(0)
-				pkt.SetChecksum(header.ICMPv6Checksum(pkt, host2IPv6Addr.AddressWithPrefix.Address, host1IPv6Addr.AddressWithPrefix.Address, buffer.VectorisedView{}))
+				pkt.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+					Header: pkt,
+					Src:    host2IPv6Addr.AddressWithPrefix.Address,
+					Dst:    host1IPv6Addr.AddressWithPrefix.Address,
+				}))
 				ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize))
 				ip.Encode(&header.IPv6Fields{
 					PayloadLength:     header.ICMPv6MinimumSize,
@@ -1392,7 +1420,11 @@ func TestPacketQueing(t *testing.T) {
 				na.Options().Serialize(header.NDPOptionsSerializer{
 					header.NDPTargetLinkLayerAddressOption(host2NICLinkAddr),
 				})
-				pkt.SetChecksum(header.ICMPv6Checksum(pkt, host2IPv6Addr.AddressWithPrefix.Address, host1IPv6Addr.AddressWithPrefix.Address, buffer.VectorisedView{}))
+				pkt.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+					Header: pkt,
+					Src:    host2IPv6Addr.AddressWithPrefix.Address,
+					Dst:    host1IPv6Addr.AddressWithPrefix.Address,
+				}))
 				payloadLength := hdr.UsedLength()
 				ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize))
 				ip.Encode(&header.IPv6Fields{
@@ -1631,7 +1663,11 @@ func TestCallsToNeighborCache(t *testing.T) {
 			}
 
 			icmp := test.createPacket()
-			icmp.SetChecksum(header.ICMPv6Checksum(icmp, test.source, test.destination, buffer.VectorisedView{}))
+			icmp.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+				Header: icmp,
+				Src:    test.source,
+				Dst:    test.destination,
+			}))
 			handleICMPInIPv6(ep, test.source, test.destination, icmp)
 
 			// Confirm the endpoint calls the correct NUDHandler method.

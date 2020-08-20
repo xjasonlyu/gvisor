@@ -150,7 +150,7 @@ func (igmp *igmpState) init(ep *endpoint) {
 // Precondition: igmp.ep.mu must be locked.
 func (igmp *igmpState) handleIGMP(pkt *stack.PacketBuffer) {
 	received := igmp.ep.stats.igmp.packetsReceived
-	headerView, ok := pkt.Data.PullUp(header.IGMPMinimumSize)
+	headerView, ok := pkt.Data().PullUp(header.IGMPMinimumSize)
 	if !ok {
 		received.invalid.Increment()
 		return
@@ -163,7 +163,7 @@ func (igmp *igmpState) handleIGMP(pkt *stack.PacketBuffer) {
 	//   same set of octets, including the checksum field. If the result
 	//   is all 1 bits (-0 in 1's complement arithmetic), the check
 	//   succeeds.
-	if header.ChecksumVV(pkt.Data, 0 /* initial */) != 0xFFFF {
+	if pkt.Data().AsRange().Checksum() != 0xFFFF {
 		received.checksumErrors.Increment()
 		return
 	}

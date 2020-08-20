@@ -98,7 +98,11 @@ func TestPingMulticastBroadcast(t *testing.T) {
 		pkt.SetType(header.ICMPv6EchoRequest)
 		pkt.SetCode(0)
 		pkt.SetChecksum(0)
-		pkt.SetChecksum(header.ICMPv6Checksum(pkt, remoteIPv6Addr, dst, buffer.VectorisedView{}))
+		pkt.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+			Header: pkt,
+			Src:    remoteIPv6Addr,
+			Dst:    dst,
+		}))
 		ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize))
 		ip.Encode(&header.IPv6Fields{
 			PayloadLength:     header.ICMPv6MinimumSize,
