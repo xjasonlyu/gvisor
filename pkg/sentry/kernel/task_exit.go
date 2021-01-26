@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -240,6 +241,17 @@ func (*runExitMain) execute(t *Task) taskRunState {
 	lastExiter := t.exitThreadGroup()
 
 	t.ResetKcov()
+
+	if atomic.LoadInt32(&t.ptraceYAMAExceptionAdded) != 0 {
+		t.k.ptraceExceptionsMu.Lock()
+		delete(t.k.ptraceExceptions, t)
+		for tracee, tracer := range t.k.ptraceExceptions {
+			if tracer == t {
+				delete(t.k.ptraceExceptions, tracee)
+			}
+		}
+		t.k.ptraceExceptionsMu.Unlock()
+	}
 
 	// If the task has a cleartid, and the thread group wasn't killed by a
 	// signal, handle that before releasing the MM.
@@ -688,7 +700,8 @@ func (t *Task) exitNotifyLocked(fromPtraceDetach bool) {
 		}
 		if t.parent != nil {
 			delete(t.parent.children, t)
-			t.parent = nil
+			// Do not clear t.parent. It may be still be needed after the task has exited
+			// (for example, to perform ptrace access checks on /proc/[pid] files).
 		}
 	}
 }

@@ -15,7 +15,9 @@
 #include <elf.h>
 #include <signal.h>
 #include <stddef.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/user.h>
@@ -30,6 +32,7 @@
 #include "absl/flags/flag.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "test/util/capability_util.h"
 #include "test/util/fs_util.h"
 #include "test/util/logging.h"
 #include "test/util/memory_util.h"
@@ -80,6 +83,10 @@ void RaiseSignal(int sig) {
 
 // Returns the Yama ptrace scope.
 PosixErrorOr<int> YamaPtraceScope() {
+  // We don't actually support security modules, but we enforce mode 1
+  // restrictions.
+  if (IsRunningOnGvisor()) return 1;
+
   constexpr char kYamaPtraceScopePath[] = "/proc/sys/kernel/yama/ptrace_scope";
 
   ASSIGN_OR_RETURN_ERRNO(bool exists, Exists(kYamaPtraceScopePath));
@@ -99,6 +106,10 @@ PosixErrorOr<int> YamaPtraceScope() {
   return scope;
 }
 
+std::string ProcPidMemPath(pid_t const pid) {
+  return "/proc/" + std::to_string(pid) + "/mem";
+}
+
 TEST(PtraceTest, AttachSelf) {
   EXPECT_THAT(ptrace(PTRACE_ATTACH, gettid(), 0, 0),
               SyscallFailsWithErrno(EPERM));
@@ -111,10 +122,584 @@ TEST(PtraceTest, AttachSameThreadGroup) {
   });
 }
 
+TEST(PtraceTest, TraceParentNotAllowed) {
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) < 1);
+  EXPECT_NO_ERRNO(SetCapability(CAP_SYS_PTRACE, false));
+
+  pid_t const child_pid = fork();
+  if (child_pid == 0) {
+    // Check /proc/[pid]/mem as a proxy for whether attaching is allowed, since
+    // both make the same access checks.
+    std::string path = ProcPidMemPath(getppid());
+    TEST_CHECK(open(path.c_str(), O_RDONLY) == -1);
+    TEST_PCHECK(errno == EACCES);
+    MaybeSave();
+    _exit(0);
+  }
+  ASSERT_THAT(child_pid, SyscallSucceeds());
+
+  int status;
+  ASSERT_THAT(waitpid(child_pid, &status, 0), SyscallSucceeds());
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << " status " << status;
+}
+
+TEST(PtraceTest, TraceNonDescendantNotAllowed) {
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) < 1);
+  EXPECT_NO_ERRNO(SetCapability(CAP_SYS_PTRACE, false));
+
+  pid_t const tracee_pid = fork();
+  if (tracee_pid == 0) {
+    while (true) {
+      SleepSafe(absl::Seconds(1));
+    }
+  }
+  EXPECT_THAT(tracee_pid, SyscallSucceeds());
+
+  pid_t const tracer_pid = fork();
+  if (tracer_pid == 0) {
+    std::string path = ProcPidMemPath(tracee_pid);
+    TEST_CHECK(open(path.c_str(), O_RDONLY) == -1);
+    TEST_PCHECK(errno == EACCES);
+    MaybeSave();
+    _exit(0);
+  }
+  EXPECT_THAT(tracer_pid, SyscallSucceeds());
+
+  // Clean up tracer.
+  int status;
+  EXPECT_THAT(waitpid(tracer_pid, &status, 0), SyscallSucceeds());
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+  // Clean up tracee.
+  ASSERT_THAT(kill(tracee_pid, SIGKILL), SyscallSucceeds());
+  ASSERT_THAT(waitpid(tracee_pid, &status, 0),
+              SyscallSucceedsWithValue(tracee_pid));
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << " status " << status;
+}
+
+TEST(PtraceTest, TraceNonDescendantWithCapabilityAllowed) {
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) < 1);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_PTRACE)));
+
+  pid_t const tracee_pid = fork();
+  if (tracee_pid == 0) {
+    while (true) {
+      SleepSafe(absl::Seconds(1));
+    }
+  }
+  EXPECT_THAT(tracee_pid, SyscallSucceeds());
+
+  pid_t const tracer_pid = fork();
+  if (tracer_pid == 0) {
+    std::string path = ProcPidMemPath(tracee_pid);
+    TEST_PCHECK(open(path.c_str(), O_RDONLY) != -1);
+    MaybeSave();
+    _exit(0);
+  }
+  EXPECT_THAT(tracer_pid, SyscallSucceeds());
+
+  // Clean up tracer.
+  int status;
+  EXPECT_THAT(waitpid(tracer_pid, &status, 0), SyscallSucceeds());
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+  // Clean up tracee.
+  ASSERT_THAT(kill(tracee_pid, SIGKILL), SyscallSucceeds());
+  ASSERT_THAT(waitpid(tracee_pid, &status, 0),
+              SyscallSucceedsWithValue(tracee_pid));
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << " status " << status;
+}
+
+TEST(PtraceTest, TraceDescendantsAllowed) {
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) > 1);
+  EXPECT_NO_ERRNO(SetCapability(CAP_SYS_PTRACE, false));
+
+  // Use socket pair to communicate tids to this process from its grandchild.
+  int sockets[2];
+  ASSERT_THAT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), SyscallSucceeds());
+
+  pid_t const child_pid = fork();
+  if (child_pid == 0) {
+    // In child process.
+    pid_t const grandchild_pid = fork();
+    if (grandchild_pid == 0) {
+      // In grandchild process.
+      pid_t const tid = gettid();
+      TEST_PCHECK(write(sockets[0], &tid, sizeof(tid)) == sizeof(tid));
+      MaybeSave();
+
+      ScopedThread t([&sockets] {
+        // In second thread of grandchild process.
+        pid_t const tid = gettid();
+        TEST_PCHECK(write(sockets[0], &tid, sizeof(tid)) == sizeof(tid));
+        MaybeSave();
+        while (true) {
+          SleepSafe(absl::Seconds(1));
+        }
+      });
+
+      while (true) {
+        SleepSafe(absl::Seconds(1));
+      }
+    }
+    TEST_PCHECK(grandchild_pid > 0);
+    MaybeSave();
+
+    // Wait for grandchild. Our parent process will kill it once it's done.
+    int status;
+    TEST_PCHECK(waitpid(grandchild_pid, &status, 0) == grandchild_pid);
+    TEST_CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+    MaybeSave();
+    _exit(0);
+  }
+  EXPECT_THAT(child_pid, SyscallSucceeds());
+
+  // We should be able to attach to any thread in the grandchild.
+  pid_t grandchild_tid1, grandchild_tid2;
+  EXPECT_THAT(read(sockets[1], &grandchild_tid1, sizeof(grandchild_tid1)),
+              SyscallSucceedsWithValue(sizeof(grandchild_tid1)));
+  EXPECT_THAT(read(sockets[1], &grandchild_tid2, sizeof(grandchild_tid2)),
+              SyscallSucceedsWithValue(sizeof(grandchild_tid2)));
+
+  std::string path = ProcPidMemPath(grandchild_tid1);
+  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(path, O_RDONLY));
+  path = ProcPidMemPath(grandchild_tid2);
+  fd = ASSERT_NO_ERRNO_AND_VALUE(Open(path, O_RDONLY));
+
+  // Clean up grandchild.
+  ASSERT_THAT(kill(grandchild_tid1, SIGKILL), SyscallSucceeds());
+
+  // Clean up child.
+  int status;
+  ASSERT_THAT(waitpid(child_pid, &status, 0),
+              SyscallSucceedsWithValue(child_pid));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << " status " << status;
+}
+
+TEST(PtraceTest, PrctlSetPtracerInvalidPID) {
+  // EINVAL should also be returned if PR_SET_PTRACER is not supported.
+  EXPECT_THAT(prctl(PR_SET_PTRACER, 123456789), SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(PtraceTest, PrctlSetPtracerPID) {
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) < 1);
+  SKIP_IF(prctl(PR_SET_PTRACER, 0) == -1);
+
+  ASSERT_NO_ERRNO(SetCapability(CAP_SYS_PTRACE, false));
+
+  // Use sockets to synchronize between tracer and tracee.
+  int sockets[2];
+  ASSERT_THAT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), SyscallSucceeds());
+
+  pid_t const tracee_pid = fork();
+  if (tracee_pid == 0) {
+    ScopedThread t([&sockets] {
+      // Perform prctl in a separate thread to verify that it is process-wide.
+      TEST_PCHECK(prctl(PR_SET_PTRACER, getppid()) == 0);
+      MaybeSave();
+      TEST_PCHECK(write(sockets[0], "x", 1) == 1);
+      MaybeSave();
+    });
+    while (true) {
+      SleepSafe(absl::Seconds(1));
+    }
+  }
+  EXPECT_THAT(tracee_pid, SyscallSucceeds());
+
+  pid_t const tracer_pid = fork();
+  if (tracer_pid == 0) {
+    // Wait until tracee has called prctl.
+    char done;
+    TEST_PCHECK(read(sockets[1], &done, 1) == 1);
+    MaybeSave();
+
+    std::string path = ProcPidMemPath(tracee_pid);
+    TEST_PCHECK(open(path.c_str(), O_RDONLY) != -1);
+    MaybeSave();
+    _exit(0);
+  }
+  EXPECT_THAT(tracer_pid, SyscallSucceeds());
+
+  // Clean up tracer.
+  int status;
+  EXPECT_THAT(waitpid(tracer_pid, &status, 0), SyscallSucceeds());
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+  // Clean up tracee.
+  ASSERT_THAT(kill(tracee_pid, SIGKILL), SyscallSucceeds());
+  ASSERT_THAT(waitpid(tracee_pid, &status, 0),
+              SyscallSucceedsWithValue(tracee_pid));
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << " status " << status;
+}
+
+TEST(PtraceTest, PrctlSetPtracerAny) {
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) < 1);
+  SKIP_IF(prctl(PR_SET_PTRACER, 0) == -1);
+
+  ASSERT_NO_ERRNO(SetCapability(CAP_SYS_PTRACE, false));
+
+  // Use sockets to synchronize between tracer and tracee.
+  int sockets[2];
+  ASSERT_THAT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), SyscallSucceeds());
+
+  pid_t const tracee_pid = fork();
+  if (tracee_pid == 0) {
+    ScopedThread t([&sockets] {
+      // Perform prctl in a separate thread to verify that it is process-wide.
+      TEST_PCHECK(prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY) == 0);
+      MaybeSave();
+      TEST_PCHECK(write(sockets[0], "x", 1) == 1);
+      MaybeSave();
+    });
+    while (true) {
+      SleepSafe(absl::Seconds(1));
+    }
+  }
+  EXPECT_THAT(tracee_pid, SyscallSucceeds());
+
+  pid_t const tracer_pid = fork();
+  if (tracer_pid == 0) {
+    // Wait until tracee has called prctl.
+    char done;
+    TEST_PCHECK(read(sockets[1], &done, 1) == 1);
+    MaybeSave();
+
+    std::string path = ProcPidMemPath(tracee_pid);
+    TEST_PCHECK(open(path.c_str(), O_RDONLY) != -1);
+    MaybeSave();
+    _exit(0);
+  }
+  EXPECT_THAT(tracer_pid, SyscallSucceeds());
+
+  // Clean up tracer.
+  int status;
+  EXPECT_THAT(waitpid(tracer_pid, &status, 0), SyscallSucceeds());
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << " status " << status;
+
+  // Clean up tracee.
+  ASSERT_THAT(kill(tracee_pid, SIGKILL), SyscallSucceeds());
+  ASSERT_THAT(waitpid(tracee_pid, &status, 0),
+              SyscallSucceedsWithValue(tracee_pid));
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << " status " << status;
+}
+
+TEST(PtraceTest, PrctlClearPtracer) {
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) < 1);
+  SKIP_IF(prctl(PR_SET_PTRACER, 0) == -1);
+
+  EXPECT_NO_ERRNO(SetCapability(CAP_SYS_PTRACE, false));
+
+  // Use sockets to synchronize between tracer and tracee.
+  int sockets[2];
+  ASSERT_THAT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), SyscallSucceeds());
+
+  pid_t const tracee_pid = fork();
+  if (tracee_pid == 0) {
+    ScopedThread t([&sockets] {
+      // Perform prctl in a separate thread to verify that it is process-wide.
+      TEST_PCHECK(prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY) == 0);
+      MaybeSave();
+      TEST_PCHECK(prctl(PR_SET_PTRACER, 0) == 0);
+      MaybeSave();
+      TEST_PCHECK(write(sockets[0], "x", 1) == 1);
+      MaybeSave();
+    });
+    while (true) {
+      SleepSafe(absl::Seconds(1));
+    }
+  }
+  EXPECT_THAT(tracee_pid, SyscallSucceeds());
+
+  pid_t const tracer_pid = fork();
+  if (tracer_pid == 0) {
+    // Wait until tracee has called prctl.
+    char done;
+    TEST_PCHECK(read(sockets[1], &done, 1) == 1);
+    MaybeSave();
+
+    std::string path = ProcPidMemPath(tracee_pid);
+    TEST_CHECK(open(path.c_str(), O_RDONLY) == -1);
+    TEST_PCHECK(errno == EACCES);
+    MaybeSave();
+    _exit(0);
+  }
+  EXPECT_THAT(tracer_pid, SyscallSucceeds());
+
+  // Clean up tracer.
+  int status;
+  EXPECT_THAT(waitpid(tracer_pid, &status, 0), SyscallSucceeds());
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << " status " << status;
+
+  // Clean up tracee.
+  ASSERT_THAT(kill(tracee_pid, SIGKILL), SyscallSucceeds());
+  ASSERT_THAT(waitpid(tracee_pid, &status, 0),
+              SyscallSucceedsWithValue(tracee_pid));
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << " status " << status;
+}
+
+TEST(PtraceTest, PrctlReplacePtracer) {
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) < 1);
+  SKIP_IF(prctl(PR_SET_PTRACER, 0) == -1);
+
+  EXPECT_NO_ERRNO(SetCapability(CAP_SYS_PTRACE, false));
+
+  // Use sockets to synchronize between tracer and tracee.
+  int sockets[2];
+  ASSERT_THAT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), SyscallSucceeds());
+
+  pid_t const unused_pid = fork();
+  if (unused_pid == 0) {
+    while (true) {
+      SleepSafe(absl::Seconds(1));
+    }
+  }
+  EXPECT_THAT(unused_pid, SyscallSucceeds());
+
+  pid_t const tracee_pid = fork();
+  if (tracee_pid == 0) {
+    TEST_PCHECK(prctl(PR_SET_PTRACER, getppid()) == 0);
+    MaybeSave();
+    ScopedThread t([&sockets, unused_pid] {
+      TEST_PCHECK(prctl(PR_SET_PTRACER, unused_pid) == 0);
+      MaybeSave();
+      TEST_PCHECK(write(sockets[0], "x", 1) == 1);
+      MaybeSave();
+    });
+    while (true) {
+      SleepSafe(absl::Seconds(1));
+    }
+  }
+  EXPECT_THAT(tracee_pid, SyscallSucceeds());
+
+  pid_t const tracer_pid = fork();
+  if (tracer_pid == 0) {
+    // Wait until tracee has called prctl.
+    char done;
+    TEST_PCHECK(read(sockets[1], &done, 1) == 1);
+    MaybeSave();
+
+    std::string path = ProcPidMemPath(tracee_pid);
+    TEST_CHECK(open(path.c_str(), O_RDONLY) == -1);
+    TEST_PCHECK(errno == EACCES);
+    MaybeSave();
+    _exit(0);
+  }
+  EXPECT_THAT(tracer_pid, SyscallSucceeds());
+
+  // Clean up tracer.
+  int status;
+  EXPECT_THAT(waitpid(tracer_pid, &status, 0), SyscallSucceeds());
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << " status " << status;
+
+  // Clean up tracee.
+  ASSERT_THAT(kill(tracee_pid, SIGKILL), SyscallSucceeds());
+  ASSERT_THAT(waitpid(tracee_pid, &status, 0),
+              SyscallSucceedsWithValue(tracee_pid));
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << " status " << status;
+
+  // Clean up unused.
+  ASSERT_THAT(kill(unused_pid, SIGKILL), SyscallSucceeds());
+  ASSERT_THAT(waitpid(unused_pid, &status, 0),
+              SyscallSucceedsWithValue(unused_pid));
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << " status " << status;
+}
+
+TEST(PtraceTest, PrctlSetPtracerPersistsPastThreadExit) {
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) < 1);
+  SKIP_IF(prctl(PR_SET_PTRACER, 0) == -1);
+
+  ASSERT_NO_ERRNO(SetCapability(CAP_SYS_PTRACE, false));
+
+  // Use sockets to synchronize between tracer and tracee.
+  int sockets[2];
+  ASSERT_THAT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), SyscallSucceeds());
+
+  pid_t const tracee_pid = fork();
+  if (tracee_pid == 0) {
+    ScopedThread t([] {
+      TEST_PCHECK(prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY) == 0);
+      MaybeSave();
+    });
+    t.Join();
+    TEST_PCHECK(write(sockets[0], "x", 1) == 1);
+    MaybeSave();
+
+    while (true) {
+      SleepSafe(absl::Seconds(1));
+    }
+  }
+  EXPECT_THAT(tracee_pid, SyscallSucceeds());
+
+  pid_t const tracer_pid = fork();
+  if (tracer_pid == 0) {
+    // Wait until the tracee thread calling prctl has terminated.
+    char done;
+    TEST_PCHECK(read(sockets[1], &done, 1) == 1);
+    MaybeSave();
+
+    std::string path = ProcPidMemPath(tracee_pid);
+    TEST_PCHECK(open(path.c_str(), O_RDONLY) != -1);
+    MaybeSave();
+    _exit(0);
+  }
+  EXPECT_THAT(tracer_pid, SyscallSucceeds());
+
+  // Clean up tracer.
+  int status;
+  EXPECT_THAT(waitpid(tracer_pid, &status, 0), SyscallSucceeds());
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << " status " << status;
+
+  // Clean up tracee.
+  ASSERT_THAT(kill(tracee_pid, SIGKILL), SyscallSucceeds());
+  ASSERT_THAT(waitpid(tracee_pid, &status, 0),
+              SyscallSucceedsWithValue(tracee_pid));
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << " status " << status;
+}
+
+TEST(PtraceTest, PrctlClearPtracerDoesNotAffectCurrentTracer) {
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) < 1);
+  SKIP_IF(prctl(PR_SET_PTRACER, 0) == -1);
+
+  ASSERT_NO_ERRNO(SetCapability(CAP_SYS_PTRACE, false));
+
+  // Use sockets to synchronize between tracer and tracee.
+  int sockets[2];
+  ASSERT_THAT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), SyscallSucceeds());
+
+  pid_t const tracee_pid = fork();
+  if (tracee_pid == 0) {
+    TEST_PCHECK(prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY) == 0);
+    MaybeSave();
+    TEST_PCHECK(write(sockets[0], "x", 1) == 1);
+    MaybeSave();
+
+    // Wait until tracer has attached before clearing PR_SET_PTRACER.
+    char done;
+    TEST_PCHECK(read(sockets[0], &done, 1) == 1);
+    MaybeSave();
+
+    TEST_PCHECK(prctl(PR_SET_PTRACER, 0) == 0);
+    MaybeSave();
+    TEST_PCHECK(write(sockets[0], &done, 1) == 1);
+    MaybeSave();
+
+    while (true) {
+      SleepSafe(absl::Seconds(1));
+    }
+  }
+  EXPECT_THAT(tracee_pid, SyscallSucceeds());
+
+  pid_t const tracer_pid = fork();
+  if (tracer_pid == 0) {
+    // Wait until tracee has called prctl, or else we won't be able to attach.
+    char done;
+    TEST_PCHECK(read(sockets[1], &done, 1) == 1);
+    MaybeSave();
+
+    TEST_PCHECK(ptrace(PTRACE_ATTACH, tracee_pid, 0, 0) == 0);
+    MaybeSave();
+    TEST_PCHECK(write(sockets[1], &done, 1) == 1);
+    MaybeSave();
+
+    // Block until tracee enters signal-delivery-stop as a result of the
+    // SIGSTOP sent by PTRACE_ATTACH.
+    int status;
+    TEST_PCHECK(waitpid(tracee_pid, &status, 0) == tracee_pid);
+    MaybeSave();
+    TEST_CHECK(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+    MaybeSave();
+
+    TEST_PCHECK(ptrace(PTRACE_CONT, tracee_pid, 0, 0) == 0);
+    MaybeSave();
+
+    // Wait until tracee has cleared PR_SET_PTRACER. Even though it was cleared,
+    // we should still be able to access /proc/[pid]/mem because we are already
+    // attached.
+    TEST_PCHECK(read(sockets[1], &done, 1) == 1);
+    MaybeSave();
+    std::string path = ProcPidMemPath(tracee_pid);
+    TEST_PCHECK(open(path.c_str(), O_RDONLY) != -1);
+    MaybeSave();
+    _exit(0);
+  }
+  EXPECT_THAT(tracer_pid, SyscallSucceeds());
+
+  // Clean up tracer.
+  int status;
+  EXPECT_THAT(waitpid(tracer_pid, &status, 0), SyscallSucceeds());
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << " status " << status;
+
+  // Clean up tracee.
+  ASSERT_THAT(kill(tracee_pid, SIGKILL), SyscallSucceeds());
+  ASSERT_THAT(waitpid(tracee_pid, &status, 0),
+              SyscallSucceedsWithValue(tracee_pid));
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << " status " << status;
+}
+
+TEST(PtraceTest, PrctlNotInherited) {
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) < 1);
+  // Allow any ptracer. This should not affect the child processes.
+  SKIP_IF(prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY) == -1);
+
+  EXPECT_NO_ERRNO(SetCapability(CAP_SYS_PTRACE, false));
+
+  pid_t const tracee_pid = fork();
+  if (tracee_pid == 0) {
+    while (true) {
+      SleepSafe(absl::Seconds(1));
+    }
+  }
+  EXPECT_THAT(tracee_pid, SyscallSucceeds());
+
+  pid_t const tracer_pid = fork();
+  if (tracer_pid == 0) {
+    std::string path = ProcPidMemPath(tracee_pid);
+    TEST_CHECK(open(path.c_str(), O_RDONLY) == -1);
+    TEST_PCHECK(errno == EACCES);
+    MaybeSave();
+    _exit(0);
+  }
+  EXPECT_THAT(tracer_pid, SyscallSucceeds());
+
+  // Clean up tracer.
+  int status;
+  EXPECT_THAT(waitpid(tracer_pid, &status, 0), SyscallSucceeds());
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << " status " << status;
+
+  // Clean up tracee.
+  ASSERT_THAT(kill(tracee_pid, SIGKILL), SyscallSucceeds());
+  ASSERT_THAT(waitpid(tracee_pid, &status, 0),
+              SyscallSucceedsWithValue(tracee_pid));
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << " status " << status;
+}
+
 TEST(PtraceTest, AttachParent_PeekData_PokeData_SignalSuppression) {
   // Yama prevents attaching to a parent. Skip the test if the scope is anything
   // except disabled.
-  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) > 0);
+  const int yama_scope = ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope());
+  SKIP_IF(yama_scope > 1);
+  if (yama_scope == 1) {
+    // Allow child to trace us.
+    ASSERT_THAT(prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY), SyscallSucceeds());
+  }
 
   // Test PTRACE_POKE/PEEKDATA on both anonymous and file mappings.
   const auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());

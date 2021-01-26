@@ -22,6 +22,7 @@
 //   ThreadGroup.timerMu
 //     ktime.Timer.mu (for kernelCPUClockTicker and IntervalTimer)
 //       TaskSet.mu
+//			   Kernel.ptraceExceptionsMu
 //         SignalHandlers.mu
 //           Task.mu
 //       runningTasksMu
@@ -282,6 +283,14 @@ type Kernel struct {
 	// If set to true, report address space activation waits as if the task is in
 	// external wait so that the watchdog doesn't report the task stuck.
 	SleepForAddressSpaceActivation bool
+
+	// Exceptions to YAMA ptrace restrictions. Each key-value pair represents a
+	// tracee-tracer relationship. The key is a process (technically, the thread
+	// group leader) that can be traced by any thread that is a descendant of the
+	// value. If the value is nil, then anyone can trace the process represented by
+	// the key.
+	ptraceExceptions   map[*Task]*Task
+	ptraceExceptionsMu sync.Mutex `state:"nosave"`
 }
 
 // InitKernelArgs holds arguments to Init.
@@ -426,6 +435,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 		k.socketsVFS2 = make(map[*vfs.FileDescription]*SocketRecord)
 	}
 
+	k.ptraceExceptions = make(map[*Task]*Task)
 	return nil
 }
 

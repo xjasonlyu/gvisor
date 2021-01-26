@@ -172,6 +172,24 @@ func Prctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		}
 		return 1, nil, nil
 
+	case linux.PR_SET_PTRACER:
+		pid := args[1].Int()
+		switch pid {
+		case 0:
+			t.ClearAllowedPtracer()
+			return 0, nil, nil
+		case linux.PR_SET_PTRACER_ANY:
+			t.AllowAnyPtracer()
+			return 0, nil, nil
+		default:
+			tracer := t.PIDNamespace().TaskWithID(kernel.ThreadID(pid))
+			if tracer == nil {
+				return 0, nil, syserror.EINVAL
+			}
+			t.AllowPtracer(tracer)
+			return 0, nil, nil
+		}
+
 	case linux.PR_SET_SECCOMP:
 		if args[1].Int() != linux.SECCOMP_MODE_FILTER {
 			// Unsupported mode.

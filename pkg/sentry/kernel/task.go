@@ -403,6 +403,11 @@ type Task struct {
 	// ptraceEventMsg is protected by the TaskSet mutex.
 	ptraceEventMsg uint64
 
+	// ptraceYAMAExceptionAdded is nonzero when a YAMA exception involving the task
+	// has been added before. This is used during task exit to decide whether we
+	// need to clean up YAMA exceptions.
+	ptraceYAMAExceptionAdded int32
+
 	// The struct that holds the IO-related usage. The ioUsage pointer is
 	// immutable.
 	ioUsage *usage.IO
