@@ -15,7 +15,9 @@
 #include <signal.h>
 #include <sys/ipc.h>
 #include <sys/sem.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cerrno>
@@ -785,6 +787,10 @@ TEST(SemaphoreTest, SemopGetncntOnSignal_NoRandomSave) {
   EXPECT_EQ(semctl(sem.get(), 0, GETNCNT), 0);
 }
 
+#ifndef SEM_STAT_ANY
+#define SEM_STAT_ANY 20
+#endif  // SEM_STAT_ANY
+
 TEST(SemaphoreTest, IpcInfo) {
   constexpr int kLoops = 5;
   std::set<int> sem_ids;
@@ -828,6 +834,17 @@ TEST(SemaphoreTest, IpcInfo) {
       ipc_set_ds.sem_perm.mode = 0200;
       ASSERT_THAT(semctl(sem_id, 0, IPC_SET, &ipc_set_ds), SyscallSucceeds());
       ASSERT_THAT(semctl(i, 0, SEM_STAT, &ds), SyscallFailsWithErrno(EACCES));
+      ASSERT_THAT(syscall(SYS_semctl, i, 0, SEM_STAT_ANY, &ds),
+                  SyscallSucceedsWithValue(sem_id));
+      EXPECT_EQ(ds.sem_perm.__key, ipc_stat_ds.sem_perm.__key);
+      EXPECT_EQ(ds.sem_perm.uid, ipc_stat_ds.sem_perm.uid);
+      EXPECT_EQ(ds.sem_perm.gid, ipc_stat_ds.sem_perm.gid);
+      EXPECT_EQ(ds.sem_perm.cuid, ipc_stat_ds.sem_perm.cuid);
+      EXPECT_EQ(ds.sem_perm.cgid, ipc_stat_ds.sem_perm.cgid);
+      EXPECT_EQ(ds.sem_perm.mode, 0200);
+      EXPECT_EQ(ds.sem_otime, ipc_stat_ds.sem_otime);
+      EXPECT_EQ(ds.sem_ctime, ipc_stat_ds.sem_ctime);
+      EXPECT_EQ(ds.sem_nsems, ipc_stat_ds.sem_nsems);
 
       sem_ids_before_max_index.insert(sem_id);
     }
@@ -906,6 +923,17 @@ TEST(SemaphoreTest, SemInfo) {
       ipc_set_ds.sem_perm.mode = 0200;
       ASSERT_THAT(semctl(sem_id, 0, IPC_SET, &ipc_set_ds), SyscallSucceeds());
       ASSERT_THAT(semctl(i, 0, SEM_STAT, &ds), SyscallFailsWithErrno(EACCES));
+      ASSERT_THAT(syscall(SYS_semctl, i, 0, SEM_STAT_ANY, &ds),
+                  SyscallSucceedsWithValue(sem_id));
+      EXPECT_EQ(ds.sem_perm.__key, ipc_stat_ds.sem_perm.__key);
+      EXPECT_EQ(ds.sem_perm.uid, ipc_stat_ds.sem_perm.uid);
+      EXPECT_EQ(ds.sem_perm.gid, ipc_stat_ds.sem_perm.gid);
+      EXPECT_EQ(ds.sem_perm.cuid, ipc_stat_ds.sem_perm.cuid);
+      EXPECT_EQ(ds.sem_perm.cgid, ipc_stat_ds.sem_perm.cgid);
+      EXPECT_EQ(ds.sem_perm.mode, 0200);
+      EXPECT_EQ(ds.sem_otime, ipc_stat_ds.sem_otime);
+      EXPECT_EQ(ds.sem_ctime, ipc_stat_ds.sem_ctime);
+      EXPECT_EQ(ds.sem_nsems, ipc_stat_ds.sem_nsems);
 
       sem_ids_before_max_index.insert(sem_id);
     }

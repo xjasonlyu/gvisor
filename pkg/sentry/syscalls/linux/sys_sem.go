@@ -186,8 +186,16 @@ func Semctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 		return uintptr(semid), nil, err
 
 	case linux.SEM_STAT_ANY:
-		t.Kernel().EmitUnimplementedEvent(t)
-		fallthrough
+		arg := args[3].Pointer()
+		// id is an index in SEM_STAT.
+		semid, ds, err := semStatAny(t, id)
+		if err != nil {
+			return 0, nil, err
+		}
+		if _, err := ds.CopyOut(t, arg); err != nil {
+			return 0, nil, err
+		}
+		return uintptr(semid), nil, err
 
 	default:
 		return 0, nil, syserror.EINVAL
@@ -238,6 +246,16 @@ func semStat(t *kernel.Task, index int32) (int32, *linux.SemidDS, error) {
 	}
 	creds := auth.CredentialsFromContext(t)
 	ds, err := set.GetStat(creds)
+	return set.ID, ds, err
+}
+
+func semStatAny(t *kernel.Task, index int32) (int32, *linux.SemidDS, error) {
+	set := t.IPCNamespace().SemaphoreRegistry().FindByIndex(index)
+	if set == nil {
+		return 0, nil, syserror.EINVAL
+	}
+	creds := auth.CredentialsFromContext(t)
+	ds, err := set.GetStatAny(creds)
 	return set.ID, ds, err
 }
 
