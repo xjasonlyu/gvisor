@@ -1262,7 +1262,10 @@ class JobControlTest : public ::testing::Test {
     // In the gVisor test environment, this test will be run as the session
     // leader already (as the sentry init process).
     if (!IsRunningOnGvisor()) {
-      ASSERT_THAT(setsid(), SyscallSucceeds());
+      // Ignore failure because setsid(2) fails if the process is already the
+      // session leader.
+      setsid();
+      ioctl(replica_.get(), TIOCNOTTY);
     }
   }
 
