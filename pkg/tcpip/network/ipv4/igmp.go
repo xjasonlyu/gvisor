@@ -145,10 +145,54 @@ func (igmp *igmpState) init(ep *endpoint) {
 	})
 }
 
+// Precondition: igmp.ep.mu must be locked.
+func (igmp *igmpState) isPacketValid(pkt *stack.PacketBuffer, messageType header.IGMPType, hasRouterAlertOption bool) bool {
+	// We can safely assume that the IP header is valid if we got this far.
+	iph := header.IPv4(pkt.NetworkHeader().View())
+
+	// As per RFC 2236 section 2,
+	//
+	//   All IGMP messages described in this document are sent with IP TTL 1, and
+	//   contain the IP Router Alert option [RFC 2113] in their IP header.
+	if !hasRouterAlertOption || iph.TTL() != header.IGMPTTL {
+		return false
+	}
+
+	var isSourceIPValid bool
+	if messageType == header.IGMPMembershipQuery {
+		// RFC 2236 does not require the IGMP implementation to check the source IP
+		// for Membership Query messages.
+		isSourceIPValid = true
+	} else {
+		// As per RFC 2236 section 10,
+		//
+		//   Ignore the Report if you cannot identify the source address of the
+		//   packet as belonging to a subnet assigned to the interface on which the
+		//   packet was received.
+		//
+		//   Ignore the Leave message if you cannot identify the source address of
+		//   the packet as belonging to a subnet assigned to the interface on which
+		//   the packet was received.
+		//
+		// Note: this rule applies to both V1 and V2 Membership Reports.
+		sourceIP := iph.SourceAddress()
+		igmp.ep.mu.addressableEndpointState.ForEachPrimaryEndpoint(func(addressEndpoint stack.AddressEndpoint) bool {
+			subnet := addressEndpoint.Subnet()
+			if subnet.Contains(sourceIP) {
+				isSourceIPValid = true
+				return true
+			}
+			return false
+		})
+	}
+
+	return isSourceIPValid
+}
+
 // handleIGMP handles an IGMP packet.
 //
 // Precondition: igmp.ep.mu must be locked.
-func (igmp *igmpState) handleIGMP(pkt *stack.PacketBuffer) {
+func (igmp *igmpState) handleIGMP(pkt *stack.PacketBuffer, hasRouterAlertOption bool) {
 	received := igmp.ep.stats.igmp.packetsReceived
 	headerView, ok := pkt.Data.PullUp(header.IGMPMinimumSize)
 	if !ok {
@@ -165,6 +209,11 @@ func (igmp *igmpState) handleIGMP(pkt *stack.PacketBuffer) {
 	//   succeeds.
 	if header.ChecksumVV(pkt.Data, 0 /* initial */) != 0xFFFF {
 		received.checksumErrors.Increment()
+		return
+	}
+
+	if !igmp.isPacketValid(pkt, h.Type(), hasRouterAlertOption) {
+		received.invalid.Increment()
 		return
 	}
 
