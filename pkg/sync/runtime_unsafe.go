@@ -55,11 +55,13 @@ func goready(gp uintptr, traceskip int)
 
 // Values for the reason argument to gopark, from Go's src/runtime/runtime2.go.
 const (
-	WaitReasonSelect uint8 = 9
+	WaitReasonSelect      uint8 = 9
+	WaitReasonChanReceive uint8 = 14
 )
 
 // Values for the traceEv argument to gopark, from Go's src/runtime/trace.go.
 const (
+	TraceEvGoBlockRecv   byte = 23
 	TraceEvGoBlockSelect byte = 24
 )
 

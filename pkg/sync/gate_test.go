@@ -12,19 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package gate_test
+package sync
 
 import (
 	"runtime"
 	"testing"
 	"time"
-
-	"gvisor.dev/gvisor/pkg/gate"
-	"gvisor.dev/gvisor/pkg/sync"
 )
 
-func TestBasicEnter(t *testing.T) {
-	var g gate.Gate
+func TestGateBasicEnter(t *testing.T) {
+	var g Gate
 
 	if !g.Enter() {
 		t.Fatalf("Failed to enter when it should be allowed")
@@ -39,7 +36,7 @@ func TestBasicEnter(t *testing.T) {
 	}
 }
 
-func enterFunc(t *testing.T, g *gate.Gate, enter, leave, reenter chan struct{}, done1, done2, done3 *sync.WaitGroup) {
+func enterFunc(t *testing.T, g *Gate, enter, leave, reenter chan struct{}, done1, done2, done3 *WaitGroup) {
 	// Wait until instructed to enter.
 	<-enter
 	if !g.Enter() {
@@ -62,9 +59,9 @@ func enterFunc(t *testing.T, g *gate.Gate, enter, leave, reenter chan struct{}, 
 	done3.Done()
 }
 
-func TestConcurrentEnter(t *testing.T) {
-	var g gate.Gate
-	var done1, done2, done3 sync.WaitGroup
+func TestGateConcurrentEnter(t *testing.T) {
+	var g Gate
+	var done1, done2, done3 WaitGroup
 
 	// Create 1000 worker goroutines.
 	enter := make(chan struct{})
@@ -90,13 +87,13 @@ func TestConcurrentEnter(t *testing.T) {
 	done3.Wait()
 }
 
-func closeFunc(g *gate.Gate, done chan struct{}) {
+func closeFunc(g *Gate, done chan struct{}) {
 	g.Close()
 	close(done)
 }
 
-func TestCloseWaits(t *testing.T) {
-	var g gate.Gate
+func TestGateCloseWaits(t *testing.T) {
+	var g Gate
 
 	// Enter 10 times.
 	for i := 0; i < 10; i++ {
@@ -123,45 +120,7 @@ func TestCloseWaits(t *testing.T) {
 	<-done
 }
 
-func TestMultipleSerialCloses(t *testing.T) {
-	var g gate.Gate
-
-	// Enter 10 times.
-	for i := 0; i < 10; i++ {
-		if !g.Enter() {
-			t.Fatalf("Failed to enter when it should be allowed")
-		}
-	}
-
-	// Launch closer. Check that it doesn't complete.
-	done := make(chan struct{})
-	go closeFunc(&g, done)
-
-	for i := 0; i < 10; i++ {
-		select {
-		case <-done:
-			t.Fatalf("Close function completed too soon")
-		case <-time.After(100 * time.Millisecond):
-		}
-
-		g.Leave()
-	}
-
-	// Now the closer must complete.
-	<-done
-
-	// Close again should not block.
-	done = make(chan struct{})
-	go closeFunc(&g, done)
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("Second Close is blocking")
-	}
-}
-
-func worker(g *gate.Gate, done *sync.WaitGroup) {
+func worker(g *Gate, done *WaitGroup) {
 	for {
 		if !g.Enter() {
 			break
@@ -173,9 +132,9 @@ func worker(g *gate.Gate, done *sync.WaitGroup) {
 	done.Done()
 }
 
-func TestConcurrentAll(t *testing.T) {
-	var g gate.Gate
-	var done sync.WaitGroup
+func TestGateConcurrentAll(t *testing.T) {
+	var g Gate
+	var done WaitGroup
 
 	// Launch 1000 goroutines to concurrently enter/leave.
 	done.Add(1000)
@@ -189,4 +148,34 @@ func TestConcurrentAll(t *testing.T) {
 
 	// Wait for all of them to complete.
 	done.Wait()
+}
+
+func BenchmarkGateEnterLeave(b *testing.B) {
+	var g Gate
+	for i := 0; i < b.N; i++ {
+		g.Enter()
+		g.Leave()
+	}
+}
+
+func BenchmarkGateClose(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		var g Gate
+		g.Close()
+	}
+}
+
+func BenchmarkGateEnterLeaveAsyncClose(b *testing.B) {
+	var wg WaitGroup
+	wg.Add(b.N)
+	for i := 0; i < b.N; i++ {
+		var g Gate
+		g.Enter()
+		go func() {
+			defer wg.Done()
+			g.Leave()
+		}()
+		g.Close()
+	}
+	wg.Wait()
 }
