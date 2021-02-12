@@ -20,12 +20,25 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/test/packetimpact/testbench"
 )
 
 func init() {
 	testbench.Initialize(flag.CommandLine)
+}
+
+func getRTO(t *testing.T, dut testbench.DUT, acceptFd int32) (rto time.Duration) {
+	info := linux.TCPInfo{}
+	infoBytes := dut.GetSockOpt(t, acceptFd, unix.SOL_TCP, unix.TCP_INFO, int32(linux.SizeOfTCPInfo))
+	if got, want := len(infoBytes), linux.SizeOfTCPInfo; got != want {
+		t.Fatalf("expected %T, got %d bytes want %d bytes", info, got, want)
+	}
+	binary.Unmarshal(infoBytes, usermem.ByteOrder, &info)
+	return time.Duration(info.RTO) * time.Microsecond
 }
 
 // TestRetransmits tests retransmits occur at exponentially increasing
@@ -55,29 +68,29 @@ func TestRetransmits(t *testing.T) {
 	// we can skip sending this ACK.
 	conn.Send(t, testbench.TCP{Flags: testbench.Uint8(header.TCPFlagAck)})
 
-	startRTO := time.Second
-	current := startRTO
-	first := time.Now()
+	rto := getRTO(t, dut, acceptFd)
+	timeout := rto + 50*time.Millisecond
+
+	startTime := time.Now()
 	dut.Send(t, acceptFd, sampleData, 0)
 	seq := testbench.Uint32(uint32(*conn.RemoteSeqNum(t)))
-	if _, err := conn.ExpectData(t, &testbench.TCP{SeqNum: seq}, samplePayload, startRTO); err != nil {
+	if _, err := conn.ExpectData(t, &testbench.TCP{SeqNum: seq}, samplePayload, timeout); err != nil {
 		t.Fatalf("expected payload was not received: %s", err)
 	}
+
 	// Expect retransmits of the same segment.
 	for i := 0; i < 5; i++ {
-		start := time.Now()
-		if _, err := conn.ExpectData(t, &testbench.TCP{SeqNum: seq}, samplePayload, 2*current); err != nil {
-			t.Fatalf("expected payload was not received: %s loop %d", err, i)
+		if _, err := conn.ExpectData(t, &testbench.TCP{SeqNum: seq}, samplePayload, timeout); err != nil {
+			t.Fatalf("expected payload was not received within %d loop %d err %s", timeout, i, err)
 		}
-		if i == 0 {
-			startRTO = time.Now().Sub(first)
-			current = 2 * startRTO
-			continue
+
+		diff := time.Now().Sub(startTime)
+		if diff < rto {
+			t.Fatalf("retransmit came sooner got: %d want: greater than %d probe %d", diff, rto, i)
 		}
-		// Check if the probes came at exponentially increasing intervals.
-		if p := time.Since(start); p < current-startRTO {
-			t.Fatalf("retransmit came sooner interval %d probe %d", p, i)
-		}
-		current *= 2
+
+		rto = getRTO(t, dut, acceptFd)
+		timeout = rto + 50*time.Millisecond
+		startTime = time.Now()
 	}
 }
