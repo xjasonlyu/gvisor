@@ -122,6 +122,9 @@ type SocketOptions struct {
 
 	// These fields are accessed and modified using atomic operations.
 
+	// sendBufferSize determines the send buffer size for this socket.
+	sendBufferSize int64
+
 	// broadcastEnabled determines whether datagram sockets are allowed to
 	// send packets to a broadcast address.
 	broadcastEnabled uint32
@@ -203,9 +206,6 @@ type SocketOptions struct {
 	// max size for send buffer. It  is initialized at the creation time and
 	// will not change.
 	getSendBufferLimits GetSendBufferLimits `state:"manual"`
-
-	// sendBufferSize determines the send buffer size for this socket.
-	sendBufferSize int64
 
 	// mu protects the access to the below fields.
 	mu sync.Mutex `state:"nosave"`
